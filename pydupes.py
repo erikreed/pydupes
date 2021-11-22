@@ -6,23 +6,21 @@ import itertools
 import logging
 import os
 import pathlib
+import stat
 import threading
 import typing
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
-from stat import S_ISLNK, S_ISREG, S_ISDIR
+from concurrent.futures import ThreadPoolExecutor, Executor, Future
 
 import click
 from tqdm import tqdm
 
-IO_CONCURRENCY = 16
 lock = threading.Lock()
 logger = logging.getLogger('pydupes')
 
 
 def none_if_io_error(f):
-    @wraps(f)
+    @functools.wraps(f)
     def wrapper(path, *args, **kwds):
         try:
             return f(path, *args, **kwds)
@@ -55,8 +53,36 @@ class FatalCrawlException(Exception):
     pass
 
 
+class PotentiallySingleThreadedExecutor(ThreadPoolExecutor):
+    def __init__(self, max_workers: int, *args, **kwargs):
+        self.disable = True
+        if max_workers > 1:
+            self.disable = False
+            super().__init__(max_workers, *args, **kwargs)
+
+    def submit(self, fn, *args, **kwargs):
+        if self.disable:
+            f = Future()
+            f.set_result(fn(*args, **kwargs))
+            return f
+        else:
+            return super().submit(fn, *args, **kwargs)
+
+    def map(self, fn, *iterables):
+        if self.disable:
+            return list(map(fn, *iterables))
+        else:
+            return super().map(fn, *iterables)
+
+    def __exit__(self, *args):
+        if not self.disable:
+            return super().__exit__(*args)
+
+
 class FileCrawler:
-    def __init__(self, roots: typing.List[pathlib.Path], progress: typing.Optional[tqdm] = None):
+    def __init__(self, roots: typing.List[pathlib.Path],
+                 pool: Executor,
+                 progress: typing.Optional[tqdm] = None):
         assert roots
         if not all(r.is_dir() for r in roots):
             raise FatalCrawlException("All roots required to be directories")
@@ -66,32 +92,34 @@ class FileCrawler:
         self._root_device = root_device_ids[0]
 
         self._size_to_paths = defaultdict(list)
-        self._pool = ThreadPoolExecutor(max_workers=IO_CONCURRENCY)
+        self._pool = pool
         self._roots = roots
         self._traversed_inodes = set()
         self._prog = progress
+        self.num_directories = len(roots)
 
-    def _traverse_path(self, path: str) -> typing.Iterator[concurrent.futures.Future]:
+    def _traverse_path(self, path: str) -> typing.List[Future]:
         futures = []
         next_dir = None
         for p in os.scandir(path):
             ppath = p.path
             if self._prog is not None:
                 self._prog.update(1)
-            stat = p.stat(follow_symlinks=False)
-            if stat.st_dev != self._root_device:
+            pstat = p.stat(follow_symlinks=False)
+            if pstat.st_dev != self._root_device:
                 logger.debug('Skipping file on separate device %s', ppath)
                 continue
-            if S_ISLNK(stat.st_mode):
+            if stat.S_ISLNK(pstat.st_mode):
                 logger.debug('Skipping symlink %s', ppath)
                 continue
-            if stat.st_ino in self._traversed_inodes:
+            if pstat.st_ino in self._traversed_inodes:
                 logger.debug('Skipping hardlink or already traversed %s', ppath)
                 continue
-            self._traversed_inodes.add(stat.st_ino)
-            if S_ISREG(stat.st_mode):
-                self._size_to_paths[stat.st_size].append(ppath)
-            elif S_ISDIR(stat.st_mode):
+            self._traversed_inodes.add(pstat.st_ino)
+            if stat.S_ISREG(pstat.st_mode):
+                self._size_to_paths[pstat.st_size].append(ppath)
+            elif stat.S_ISDIR(pstat.st_mode):
+                self.num_directories += 1
                 if not next_dir:
                     next_dir = ppath
                 else:
@@ -103,11 +131,11 @@ class FileCrawler:
         return futures
 
     def traverse(self):
-        futures = [self._traverse_path(str(r)) for r in self._roots]
+        futures = [self._traverse_path(str(r)) for r in set(self._roots)]
         self._unwrap_futures(itertools.chain.from_iterable(futures))
 
     def size_bytes(self):
-        return sum(self._size_to_paths.keys())
+        return sum(k * len(v) for k, v in self._size_to_paths.items())
 
     def size_bytes_unique(self):
         return sum(k for k, v in self._size_to_paths.items() if len(v) == 1)
@@ -127,7 +155,7 @@ class FileCrawler:
 
 class DupeFinder:
     def __init__(self, size_bytes: int,
-                 pool: concurrent.futures.Executor,
+                 pool: Executor,
                  output: typing.Optional[typing.TextIO] = None,
                  file_progress: typing.Optional[tqdm] = None,
                  byte_progress: typing.Optional[tqdm] = None):
@@ -209,7 +237,9 @@ class DupeFinder:
 @click.option('--output', type=click.File('w'), help='Save line-delimited input/duplicate filename pairs')
 @click.option('--verbose', is_flag=True)
 @click.option('--progress', is_flag=True)
-def main(input_paths, output, verbose, progress):
+@click.option('--concurrency', type=click.IntRange(min=1), default=16,
+              help='Level of IO concurrency. Setting to 0 disables all threading/concurrency.')
+def main(input_paths, output, verbose, progress, concurrency):
     input_paths = [pathlib.Path(p) for p in input_paths]
     if not input_paths:
         click.echo(click.get_current_context().get_help())
@@ -219,8 +249,9 @@ def main(input_paths, output, verbose, progress):
     logger.info('Traversing input paths: %s', [str(p.absolute()) for p in input_paths])
 
     now = datetime.datetime.now()
-    with tqdm(smoothing=0, desc='Traversing', unit=' files', disable=not progress) as prog:
-        crawler = FileCrawler(input_paths, prog)
+    with tqdm(smoothing=0, desc='Traversing', unit=' files', disable=not progress, mininterval=1) as file_progress, \
+            PotentiallySingleThreadedExecutor(max_workers=concurrency) as io_pool:
+        crawler = FileCrawler(input_paths, io_pool, file_progress)
         crawler.traverse()
 
     size = crawler.size_bytes()
@@ -229,26 +260,27 @@ def main(input_paths, output, verbose, progress):
     num_files = sum(1 for _ in crawler.files())
     size_groups = crawler.filter_groups()
     num_potential_dupes = sum(len(g) for g in size_groups.values())
-    del crawler
 
     now2 = datetime.datetime.now()
     logger.info('Traversal time: %.1fs', (now2 - now).total_seconds())
     logger.info('Cursory file count: %d (%s), excluding symlinks and dupe inodes',
                 num_files,
                 sizeof_fmt(size))
-    logger.info('Potential duplicates from size filter: %d (%s)',
+    logger.info('Directory count: %d', crawler.num_directories)
+    logger.info('Size filter reduced file count to: %d (%s)',
                 num_potential_dupes,
                 sizeof_fmt(size_potential_dupes))
+    del crawler
 
-    with ThreadPoolExecutor(max_workers=IO_CONCURRENCY) as scheduler_pool, \
-            ThreadPoolExecutor(max_workers=IO_CONCURRENCY) as io_pool, \
+    with PotentiallySingleThreadedExecutor(max_workers=concurrency) as scheduler_pool, \
+            PotentiallySingleThreadedExecutor(max_workers=concurrency) as io_pool, \
             tqdm(smoothing=0, desc='Filtering', unit=' files',
-                 position=0,
+                 position=0, mininterval=1,
                  total=num_potential_dupes,
                  disable=not progress) as file_progress, \
             tqdm(smoothing=0, desc='Filtering', unit='B',
                  position=1, unit_scale=True, unit_divisor=1024,
-                 total=size_potential_dupes,
+                 total=size_potential_dupes, mininterval=1,
                  disable=not progress) as bytes_progress:
 
         futures = []
