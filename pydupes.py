@@ -144,8 +144,8 @@ class FileCrawler:
         return itertools.chain.from_iterable(self._size_to_paths.values())
 
     def filter_groups(self):
-        return {k: v for k, v in self._size_to_paths.items()
-                if len(v) > 1 and k > 1}
+        return [(k, v) for k, v in self._size_to_paths.items()
+                if len(v) > 1 and k > 1]
 
     @classmethod
     def _unwrap_futures(cls, futures):
@@ -227,7 +227,7 @@ class DupeFinder:
             yield from self.split_by_outer_bytes(g)
 
     def _map(self, fn, iterables):
-        if len(iterables) < 16:
+        if len(iterables) < 16 or self.size_bytes > 2 ** 20 * 32:
             return map(fn, iterables)
         return self._pool.map(fn, iterables)
 
@@ -259,7 +259,7 @@ def main(input_paths, output, verbose, progress, concurrency):
     size_potential_dupes = size - size_unique
     num_files = sum(1 for _ in crawler.files())
     size_groups = crawler.filter_groups()
-    num_potential_dupes = sum(len(g) for g in size_groups.values())
+    num_potential_dupes = sum(len(g) for _, g in size_groups)
 
     now2 = datetime.datetime.now()
     logger.info('Traversal time: %.1fs', (now2 - now).total_seconds())
@@ -285,7 +285,7 @@ def main(input_paths, output, verbose, progress, concurrency):
 
         futures = []
         dupe_finders = []
-        for s, group in size_groups.items():
+        for s, group in size_groups:
             dupe_finder = DupeFinder(size_bytes=s, pool=io_pool, output=output,
                                      file_progress=file_progress, byte_progress=bytes_progress)
             futures.append(scheduler_pool.submit(dupe_finder.find, group))
