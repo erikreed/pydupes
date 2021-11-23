@@ -1,4 +1,3 @@
-import concurrent.futures
 import datetime
 import functools
 import hashlib
@@ -168,7 +167,7 @@ class DupeFinder:
     def find(self, paths: typing.List[str]) -> typing.List[str]:
         files_start = len(paths)
         if self.size_bytes >= 8192:
-            path_groups = list(self.split_by_ends(paths))
+            path_groups = list(self._split_by_boundaries(paths))
         else:
             path_groups = [paths]
         files_end = sum(len(p) for p in path_groups)
@@ -205,26 +204,24 @@ class DupeFinder:
 
     @staticmethod
     @none_if_io_error
-    def _read_edge(path: str, size: int) -> bytes:
+    def _read_boundary(path: str, size: int) -> bytes:
         with open(path, 'rb', buffering=0) as f:
             if size < 0:
                 f.seek(size, os.SEEK_END)
             return f.read(abs(size))
 
-    def split_by_outer_bytes(self, group: typing.List[str]):
+    def _split_by_boundary(self, group: typing.List[str], end: bool):
         matches = defaultdict(list)
-        for path, edge in zip(group, self._map(functools.partial(self._read_edge, size=-4096), group)):
+        size = -4096 if end else 4096
+        boundaries = self._map(functools.partial(self._read_boundary, size=size), group)
+        for path, edge in zip(group, boundaries):
             matches[edge].append(path)
-        return [g for edge, g in matches.items() if edge and len(g) > 1]
+        return [g for boundary, g in matches.items() if boundary and len(g) > 1]
 
-    def split_by_ends(self, group: typing.List[str]):
-        matches = defaultdict(list)
-        for path, edge in zip(group, self._map(functools.partial(self._read_edge, size=4096), group)):
-            matches[edge].append(path)
-        groups = [g for edge, g in matches.items() if edge and len(g) > 1]
-        del matches
+    def _split_by_boundaries(self, group: typing.List[str]):
+        groups = self._split_by_boundary(group, end=False)
         for g in groups:
-            yield from self.split_by_outer_bytes(g)
+            yield from self._split_by_boundary(g, end=True)
 
     def _map(self, fn, iterables):
         if len(iterables) < 16 or self.size_bytes > 2 ** 20 * 32:
@@ -232,11 +229,14 @@ class DupeFinder:
         return self._pool.map(fn, iterables)
 
 
-@click.command()
-@click.argument('input_paths', type=click.Path(exists=True, file_okay=False, writable=True, readable=True), nargs=-1)
-@click.option('--output', type=click.File('w'), help='Save line-delimited input/duplicate filename pairs')
-@click.option('--verbose', is_flag=True)
-@click.option('--progress', is_flag=True)
+@click.command(help="A duplicate file finder that may be faster in environments with "
+                    "millions of files and terabytes of data or over high latency filesystems.")
+@click.argument('input_paths', type=click.Path(
+    exists=True, file_okay=False, writable=True, readable=True), nargs=-1)
+@click.option('--output', type=click.File('w'),
+              help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
+@click.option('--verbose', is_flag=True, help='Enable debug logging.')
+@click.option('--progress', is_flag=True, help='Enable progress bars.')
 @click.option('--concurrency', type=click.IntRange(min=1), default=16,
               help='Level of IO concurrency. Setting to 0 disables all threading/concurrency.')
 def main(input_paths, output, verbose, progress, concurrency):
@@ -248,8 +248,9 @@ def main(input_paths, output, verbose, progress, concurrency):
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
     logger.info('Traversing input paths: %s', [str(p.absolute()) for p in input_paths])
 
-    now = datetime.datetime.now()
-    with tqdm(smoothing=0, desc='Traversing', unit=' files', disable=not progress, mininterval=1) as file_progress, \
+    time_start = datetime.datetime.now()
+    with tqdm(smoothing=0, desc='Traversing', unit=' files',
+              disable=not progress, mininterval=1) as file_progress, \
             PotentiallySingleThreadedExecutor(max_workers=concurrency) as io_pool:
         crawler = FileCrawler(input_paths, io_pool, file_progress)
         crawler.traverse()
@@ -261,8 +262,8 @@ def main(input_paths, output, verbose, progress, concurrency):
     size_groups = crawler.filter_groups()
     num_potential_dupes = sum(len(g) for _, g in size_groups)
 
-    now2 = datetime.datetime.now()
-    logger.info('Traversal time: %.1fs', (now2 - now).total_seconds())
+    time_traverse = datetime.datetime.now()
+    logger.info('Traversal time: %.1fs', (time_traverse - time_start).total_seconds())
     logger.info('Cursory file count: %d (%s), excluding symlinks and dupe inodes',
                 num_files,
                 sizeof_fmt(size))
@@ -298,14 +299,13 @@ def main(input_paths, output, verbose, progress, concurrency):
             dupe_count += len(dupes)
             dupe_total_size += len(dupes) * dupe_finder.size_bytes
 
-    now3 = datetime.datetime.now()
-    logger.info('Comparison time: %.1fs', (now3 - now2).total_seconds())
-    logger.info('Total time elapsed: %.1fs', (now3 - now).total_seconds())
+    dt_complete = datetime.datetime.now()
+    logger.info('Comparison time: %.1fs', (dt_complete - time_traverse).total_seconds())
+    logger.info('Total time elapsed: %.1fs', (dt_complete - time_start).total_seconds())
 
     logger.info('Number of duplicate files: %s', dupe_count)
     logger.info('Size of duplicate content: %s', sizeof_fmt(dupe_total_size))
 
 
 if __name__ == '__main__':
-    "xargs -0 -n2 echo ln --force --verbose {} {} < pydupes.txt"
     main()
