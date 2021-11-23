@@ -33,7 +33,7 @@ telegram = ["requests"]
 [metadata]
 lock-version = "1.1"
 python-versions = "^3.5"
-content-hash = "ec465729acaa4ffa7dff4c218b8ed7fff2aa52f1909f2ea21892711fcef0dbb6"
+content-hash = "e9eae99b262d4418f8bc292e19ace618bdde503440d83ed9196dbbe0a4e2b176"
 
 [metadata.files]
 click = [

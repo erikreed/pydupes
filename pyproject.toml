@@ -1,13 +1,17 @@
 [tool.poetry]
 name = "pydupes"
-version = "0.0.0"
-description = "Yet another duplicate file finder that may be faster in environments with millions of files and terabytes of data or over high latency filesystems."
+version = "0.0.1"
+description = "A duplicate file finder that may be faster in environments with millions of files and terabytes of data."
 authors = ["Erik Reed <erik.reed@pm.me>"]
 license = "MIT"
+readme = "README.md"
+keywords = ['deduplication', 'files', 'duplicate']
+homepage = "https://github.com/erikreed/pydupes"
+repository = "https://github.com/erikreed/pydupes"
 
 [tool.poetry.dependencies]
 python = "^3.5"
-click = "^7"
+click = "^8;^7"
 tqdm = "^4"
 
 [tool.poetry.dev-dependencies]
