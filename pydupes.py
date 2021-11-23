@@ -24,7 +24,7 @@ def none_if_io_error(f):
         try:
             return f(path, *args, **kwds)
         except IOError as e:
-            logger.error('Unable to read "%s" due to:', path, e)
+            logger.error('Unable to read "%s" due to: %s', path, e)
 
     return wrapper
 
@@ -113,6 +113,9 @@ class FileCrawler:
                 continue
             if pstat.st_ino in self._traversed_inodes:
                 logger.debug('Skipping hardlink or already traversed %s', ppath)
+                continue
+            if pstat.st_size == 0:
+                logger.debug('Skipping empty file $s', ppath)
                 continue
             self._traversed_inodes.add(pstat.st_ino)
             if stat.S_ISREG(pstat.st_mode):

@@ -2,6 +2,8 @@
 that may be faster in environments with millions of files and terabytes
 of data or over high latency filesystems (e.g. NFS).
 
+-------------------
+
 The algorithm is similar to [rdfind](https://github.com/pauldreik/rdfind) with threading and consolidation of
 filtering logic (instead of separate passes).
 - traverse the input paths, collecting the inodes and file sizes
@@ -15,12 +17,16 @@ Constraints:
 - concurrent modification of a traversed directory could produce false duplicate pairs 
 (modification after hash computation)
 
-### Install
+## Setup
 ```bash
+# via pip
 pip3 install --user --upgrade pydupes
+
+# or simply if pipx installed:
+pipx run pydupes --help
 ```
 
-### Usage
+## Usage
 
 ```bash
 # Collect counts and stage the duplicate files, null-delimited source-target pairs:
@@ -30,5 +36,46 @@ pydupes /path1 /path2 --progress --output dupes.txt
 xargs -0 -n2 echo ln --force --verbose {} {} < dupes.txt
 ```
 
-### Benchmarks
+## Benchmarks
+Hardware is a 6 spinning disk RAID5 ext4 with
+250GB memory, Ubuntu 18.04. Peak memory and runtimes via:
+```/usr/bin/time -v```.
 
+### Dataset 1:
+- Directories: ~33k
+- Files: ~14 million
+- Total size: 11TB
+
+The tradeoff here is a 2x decrease in wall-clock time vs a 4x on peak memory.
+
+#### Pydupes
+- Elapsed (wall clock) time (h:mm:ss or m:ss): 46:52.66
+- Maximum resident set size (kbytes): 11564692 (~11GB)
+```
+INFO:pydupes:Traversing input paths: ['/raid/erik']
+INFO:pydupes:Traversal time: 343.7s
+INFO:pydupes:Cursory file count: 14419138 (10.9TiB), excluding symlinks and dupe inodes
+INFO:pydupes:Directory count: 33376
+INFO:pydupes:Size filter reduced file count to: 14114518 (7.3TiB)
+INFO:pydupes:Comparison time: 2462.0s
+INFO:pydupes:Total time elapsed: 2805.8s
+INFO:pydupes:Number of duplicate files: 936948
+INFO:pydupes:Size of duplicate content: 304.1GiB
+```
+
+#### rdfind
+- Elapsed (wall clock) time (h:mm:ss or m:ss): 1:57:20
+- Maximum resident set size (kbytes): 3636396 (~3GB)
+```
+Now scanning "/raid/erik", found 14419182 files.
+Now have 14419182 files in total.
+Removed 44 files due to nonunique device and inode.
+Now removing files with zero size from list...removed 2396 files
+Total size is 11961280180699 bytes or 11 TiB
+Now sorting on size:removed 301978 files due to unique sizes from list.14114764 files left.
+Now eliminating candidates based on first bytes:removed 8678999 files from list.5435765 files left.
+Now eliminating candidates based on last bytes:removed 3633992 files from list.1801773 files left.
+Now eliminating candidates based on md5 checksum:removed 158638 files from list.1643135 files left.
+It seems like you have 1643135 files that are not unique
+Totally, 304 GiB can be reduced.
+```
