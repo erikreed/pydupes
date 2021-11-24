@@ -53,6 +53,7 @@ class FatalCrawlException(Exception):
 
 
 class PotentiallySingleThreadedExecutor(ThreadPoolExecutor):
+    # TODO: benchmark https://github.com/brmmm3/fastthreadpool
     def __init__(self, max_workers: int, *args, **kwargs):
         self.disable = True
         if max_workers > 1:
@@ -79,6 +80,8 @@ class PotentiallySingleThreadedExecutor(ThreadPoolExecutor):
 
 
 class FileCrawler:
+    __slots__ = ('_root_device', '_size_to_paths', '_pool', '_roots', '_traversed_inodes', '_prog', 'num_directories')
+
     def __init__(self, roots: typing.List[pathlib.Path],
                  pool: Executor,
                  progress: typing.Optional[tqdm] = None):
@@ -156,8 +159,9 @@ class FileCrawler:
 
 
 class DupeFinder:
-    def __init__(self, size_bytes: int,
-                 pool: Executor,
+    __slots__ = ('_pool', '_output', '_file_progress', '_byte_progress',)
+
+    def __init__(self, pool: Executor,
                  output: typing.Optional[typing.TextIO] = None,
                  file_progress: typing.Optional[tqdm] = None,
                  byte_progress: typing.Optional[tqdm] = None):
@@ -165,25 +169,24 @@ class DupeFinder:
         self._output = output
         self._file_progress = file_progress
         self._byte_progress = byte_progress
-        self.size_bytes = size_bytes
 
-    def find(self, paths: typing.List[str]) -> typing.List[str]:
+    def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str]:
         files_start = len(paths)
-        if self.size_bytes >= 8192:
-            path_groups = list(self._split_by_boundaries(paths))
+        if size_bytes > 8192:
+            path_groups = list(self._split_by_boundaries(size_bytes, paths))
         else:
             path_groups = [paths]
         files_end = sum(len(p) for p in path_groups)
         if self._file_progress is not None:
             self._file_progress.update(files_start - files_end)
         if self._byte_progress is not None:
-            self._byte_progress.update(self.size_bytes * (files_start - files_end))
+            self._byte_progress.update(size_bytes * (files_start - files_end))
 
         dupes = []
         for paths in path_groups:
             hashes = dict()
             paths.sort(key=len)
-            for p, hash in zip(paths, self._map(sha256sum, paths)):
+            for p, hash in zip(paths, self._map(sha256sum, paths, size_bytes)):
                 if not hash:
                     # some read error occurred
                     continue
@@ -202,32 +205,35 @@ class DupeFinder:
                 if self._file_progress is not None:
                     self._file_progress.update(1)
                 if self._byte_progress is not None:
-                    self._byte_progress.update(self.size_bytes)
-        return dupes
+                    self._byte_progress.update(size_bytes)
+        return tuple(dupes)
 
     @staticmethod
     @none_if_io_error
-    def _read_boundary(path: str, size: int) -> bytes:
+    def _read_boundary(path: str, size: int, use_hash=True) -> typing.Union[bytes, int]:
         with open(path, 'rb', buffering=0) as f:
             if size < 0:
                 f.seek(size, os.SEEK_END)
-            return f.read(abs(size))
+            boundary = f.read(abs(size))
+        if use_hash:
+            return hash(boundary)
+        return boundary
 
-    def _split_by_boundary(self, group: typing.List[str], end: bool):
+    def _split_by_boundary(self, size_bytes:int, group: typing.List[str], end: bool):
         matches = defaultdict(list)
         size = -4096 if end else 4096
-        boundaries = self._map(functools.partial(self._read_boundary, size=size), group)
+        boundaries = self._map(functools.partial(self._read_boundary, size=size), group, size_bytes)
         for path, edge in zip(group, boundaries):
             matches[edge].append(path)
-        return [g for boundary, g in matches.items() if boundary and len(g) > 1]
+        return [g for boundary, g in matches.items() if boundary is not None and len(g) > 1]
 
-    def _split_by_boundaries(self, group: typing.List[str]):
-        groups = self._split_by_boundary(group, end=False)
+    def _split_by_boundaries(self, size_bytes:int, group: typing.List[str]):
+        groups = self._split_by_boundary(size_bytes, group, end=False)
         for g in groups:
-            yield from self._split_by_boundary(g, end=True)
+            yield from self._split_by_boundary(size_bytes, g, end=True)
 
-    def _map(self, fn, iterables):
-        if len(iterables) < 16 or self.size_bytes > 2 ** 20 * 32:
+    def _map(self, fn, iterables, size_bytes):
+        if len(iterables) < 16 or size_bytes > 2 ** 20 * 32:
             return map(fn, iterables)
         return self._pool.map(fn, iterables)
 
@@ -288,19 +294,21 @@ def main(input_paths, output, verbose, progress, concurrency):
                  disable=not progress) as bytes_progress:
 
         futures = []
-        dupe_finders = []
-        for s, group in size_groups:
-            dupe_finder = DupeFinder(size_bytes=s, pool=io_pool, output=output,
-                                     file_progress=file_progress, byte_progress=bytes_progress)
-            futures.append(scheduler_pool.submit(dupe_finder.find, group))
-            dupe_finders.append(dupe_finder)
+        sizes = []
+        dupe_finder = DupeFinder(pool=io_pool, output=output,
+                                 file_progress=file_progress, byte_progress=bytes_progress)
+        while size_groups:
+            size_bytes, group = size_groups.pop()
+            futures.append(scheduler_pool.submit(dupe_finder.find, size_bytes, group))
+            sizes.append(size_bytes)
 
         dupe_count = 0
         dupe_total_size = 0
-        for dupe_finder, f in zip(dupe_finders, futures):
-            dupes = f.result()
+        while futures:
+            dupes = futures.pop().result()
+            size_bytes = sizes.pop()
             dupe_count += len(dupes)
-            dupe_total_size += len(dupes) * dupe_finder.size_bytes
+            dupe_total_size += len(dupes) * size_bytes
 
     dt_complete = datetime.datetime.now()
     logger.info('Comparison time: %.1fs', (dt_complete - time_traverse).total_seconds())

@@ -46,19 +46,19 @@ Hardware is a 6 spinning disk RAID5 ext4 with
 - Files: ~14 million
 - Total size: 11TB
 
-The tradeoff here is a 2x decrease in wall-clock time vs a 4x on peak memory.
+The tradeoff here is a 2x decrease in wall-clock time vs a 2x on peak memory.
 
-#### Pydupes
-- Elapsed (wall clock) time (h:mm:ss or m:ss): 46:52.66
-- Maximum resident set size (kbytes): 11564692 (~11GB)
+#### pydupes
+- Elapsed (wall clock) time (h:mm:ss or m:ss): 47:04.99
+- Maximum resident set size (kbytes): 5969984 (~6GB)
 ```
 INFO:pydupes:Traversing input paths: ['/raid/erik']
-INFO:pydupes:Traversal time: 343.7s
-INFO:pydupes:Cursory file count: 14419138 (10.9TiB), excluding symlinks and dupe inodes
+INFO:pydupes:Traversal time: 343.2s
+INFO:pydupes:Cursory file count: 14416742 (10.9TiB), excluding symlinks and dupe inodes
 INFO:pydupes:Directory count: 33376
 INFO:pydupes:Size filter reduced file count to: 14114518 (7.3TiB)
-INFO:pydupes:Comparison time: 2462.0s
-INFO:pydupes:Total time elapsed: 2805.8s
+INFO:pydupes:Comparison time: 2481.4s
+INFO:pydupes:Total time elapsed: 2824.6s
 INFO:pydupes:Number of duplicate files: 936948
 INFO:pydupes:Size of duplicate content: 304.1GiB
 ```
@@ -78,4 +78,13 @@ Now eliminating candidates based on last bytes:removed 3633992 files from list.1
 Now eliminating candidates based on md5 checksum:removed 158638 files from list.1643135 files left.
 It seems like you have 1643135 files that are not unique
 Totally, 304 GiB can be reduced.
+```
+
+#### fdupes
+Note that this isn't a fair comparison since fdupes additionally performs a byte-by-byte comparison on
+MD5 match. Invocation with "fdupes --size --summarize --recurse --quiet".
+- Elapsed (wall clock) time (h:mm:ss or m:ss): 2:58:32
+- Maximum resident set size (kbytes): 3649420 (~3GB)
+```
+939588 duplicate files (in 705943 sets), occupying 326547.7 megabytes
 ```

@@ -8,7 +8,8 @@ import tempfile
 import pytest
 import tqdm
 
-from pydupes import DupeFinder, FileCrawler, PotentiallySingleThreadedExecutor, FatalCrawlException, main
+from pydupes import (
+    DupeFinder, FileCrawler, PotentiallySingleThreadedExecutor, FatalCrawlException, main)
 
 
 def create_dir1(root: pathlib.Path):
@@ -89,8 +90,8 @@ class TestPydupes:
             for f in g:
                 assert 'large' in f
 
-            finder = DupeFinder(size, pool, file_progress=progress, byte_progress=progress)
-            dupes = finder.find(g)
+            finder = DupeFinder(pool, file_progress=progress, byte_progress=progress)
+            dupes = finder.find(size, g)
             assert len(dupes) == 1
             assert dupes[0].endswith('/large-dupe.bin')
 
@@ -103,8 +104,8 @@ class TestPydupes:
             crawler.traverse()
         groups = crawler.filter_groups()
         size, g = groups[0]
-        finder = DupeFinder(size, pool)
-        dupes = finder.find(g)
+        finder = DupeFinder(pool)
+        dupes = finder.find(size, g)
         assert not dupes
 
     def test_nested(self, pool, progress):
@@ -137,8 +138,8 @@ class TestPydupes:
             for f in g1:
                 assert 'small' in f
 
-            finder = DupeFinder(size1, pool, file_progress=progress, byte_progress=progress)
-            dupes = finder.find(g1)
+            finder = DupeFinder(pool, file_progress=progress, byte_progress=progress)
+            dupes = finder.find(size1, g1)
             assert len(dupes) == 2
 
             size2, g2 = groups[1]
@@ -148,8 +149,9 @@ class TestPydupes:
                 assert 'large' in f
 
             output = io.StringIO()
-            finder = DupeFinder(size2, pool, file_progress=progress, byte_progress=progress, output=output)
-            dupes = finder.find(g2)
+            finder = DupeFinder(
+                pool, file_progress=progress, byte_progress=progress, output=output)
+            dupes = finder.find(size2, g2)
             assert len(dupes) == 11
 
             pairs = collections.deque(output.getvalue().split('\0'))
@@ -160,6 +162,8 @@ class TestPydupes:
             while pairs:
                 a, b = pairs.popleft(), pairs.popleft()
                 assert 'nested' in b or 'dupe' in b
+                assert 'nested' not in a
+                assert 'dupe' not in a
 
 
 class TestIntegration:
@@ -183,3 +187,5 @@ class TestIntegration:
             while pairs:
                 a, b = pairs.popleft(), pairs.popleft()
                 assert 'nested' in b or 'dupe' in b
+                assert 'nested' not in a
+                assert 'dupe' not in a
