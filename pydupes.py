@@ -107,7 +107,11 @@ class FileCrawler:
             ppath = p.path
             if self._prog is not None:
                 self._prog.update(1)
-            pstat = p.stat(follow_symlinks=False)
+            try:
+                pstat = p.stat(follow_symlinks=False)
+            except OSError as e:
+                logger.error('Unable to stat %s due to: %s', ppath, e)
+                continue
             if pstat.st_dev != self._root_device:
                 logger.debug('Skipping file on separate device %s', ppath)
                 continue
@@ -219,7 +223,7 @@ class DupeFinder:
             return hash(boundary)
         return boundary
 
-    def _split_by_boundary(self, size_bytes:int, group: typing.List[str], end: bool):
+    def _split_by_boundary(self, size_bytes: int, group: typing.List[str], end: bool):
         matches = defaultdict(list)
         size = -4096 if end else 4096
         boundaries = self._map(functools.partial(self._read_boundary, size=size), group, size_bytes)
@@ -227,7 +231,7 @@ class DupeFinder:
             matches[edge].append(path)
         return [g for boundary, g in matches.items() if boundary is not None and len(g) > 1]
 
-    def _split_by_boundaries(self, size_bytes:int, group: typing.List[str]):
+    def _split_by_boundaries(self, size_bytes: int, group: typing.List[str]):
         groups = self._split_by_boundary(size_bytes, group, end=False)
         for g in groups:
             yield from self._split_by_boundary(size_bytes, g, end=True)
@@ -241,7 +245,7 @@ class DupeFinder:
 @click.command(help="A duplicate file finder that may be faster in environments with "
                     "millions of files and terabytes of data or over high latency filesystems.")
 @click.argument('input_paths', type=click.Path(
-    exists=True, file_okay=False, writable=True, readable=True), nargs=-1)
+    exists=True, file_okay=False, readable=True), nargs=-1)
 @click.option('--output', type=click.File('w'),
               help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
 @click.option('--verbose', is_flag=True, help='Enable debug logging.')
