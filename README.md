@@ -2,6 +2,8 @@
 that may be faster in environments with millions of files and terabytes
 of data or over high latency filesystems (e.g. NFS).
 
+[![PyPI version](https://badge.fury.io/py/pydupes.svg)](https://badge.fury.io/py/pydupes)
+
 -------------------
 
 The algorithm is similar to [rdfind](https://github.com/pauldreik/rdfind) with threading and consolidation of
