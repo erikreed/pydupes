@@ -43,22 +43,21 @@ Hardware is a 6 spinning disk RAID5 ext4 with
 
 ### Dataset 1:
 - Directories: ~33k
-- Files: ~14 million
-- Total size: 11TB
-
-The tradeoff here is a 2x decrease in wall-clock time vs a 2x on peak memory.
+- Files: ~14 million, 1 million duplicate
+- Total size: ~11TB, 300GB duplicate
 
 #### pydupes
-- Elapsed (wall clock) time (h:mm:ss or m:ss): 47:04.99
-- Maximum resident set size (kbytes): 5969984 (~6GB)
+- Elapsed (wall clock) time (h:mm:ss or m:ss): 39:04.73
+- Maximum resident set size (kbytes): 3356936 (~3GB)
 ```
 INFO:pydupes:Traversing input paths: ['/raid/erik']
-INFO:pydupes:Traversal time: 343.2s
+INFO:pydupes:Traversal time: 209.6s
 INFO:pydupes:Cursory file count: 14416742 (10.9TiB), excluding symlinks and dupe inodes
 INFO:pydupes:Directory count: 33376
+INFO:pydupes:Number of candidate groups: 720263
 INFO:pydupes:Size filter reduced file count to: 14114518 (7.3TiB)
-INFO:pydupes:Comparison time: 2481.4s
-INFO:pydupes:Total time elapsed: 2824.6s
+INFO:pydupes:Comparison time: 2134.6s
+INFO:pydupes:Total time elapsed: 2344.2s
 INFO:pydupes:Number of duplicate files: 936948
 INFO:pydupes:Size of duplicate content: 304.1GiB
 ```

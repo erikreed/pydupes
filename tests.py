@@ -1,4 +1,3 @@
-from click.testing import CliRunner
 import collections
 import io
 import os
@@ -7,9 +6,11 @@ import tempfile
 
 import pytest
 import tqdm
+from click.testing import CliRunner
 
 from pydupes import (
-    DupeFinder, FileCrawler, PotentiallySingleThreadedExecutor, FatalCrawlException, main)
+    DupeFinder, FileCrawler,
+    FatalCrawlException, main, FutureFreeThreadPool)
 
 
 def create_dir1(root: pathlib.Path):
@@ -54,11 +55,11 @@ def create_dir1(root: pathlib.Path):
 
 
 class Pools:
-    single = PotentiallySingleThreadedExecutor(max_workers=0)
-    threaded = PotentiallySingleThreadedExecutor(max_workers=4)
+    future_free = FutureFreeThreadPool(threads=4)
+    future_free_small_queue = FutureFreeThreadPool(threads=2, queue_size=1)
 
 
-@pytest.mark.parametrize('pool', [Pools.single, Pools.threaded])
+@pytest.mark.parametrize('pool', [Pools.future_free, Pools.future_free_small_queue])
 @pytest.mark.parametrize('progress', [tqdm.tqdm(disable=True), None])
 class TestPydupes:
     def test_unable_read(self, pool, progress):
@@ -107,6 +108,28 @@ class TestPydupes:
         finder = DupeFinder(pool)
         dupes = finder.find(size, g)
         assert not dupes
+
+    def test_concurrent_modification_append(self, pool, progress):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            d1 = tmp / 'dir1'
+            create_dir1(d1)
+            crawler = FileCrawler([d1], pool=pool, progress=progress)
+            crawler.traverse()
+            groups = crawler.filter_groups()
+            size, g = groups[0]
+            finder = DupeFinder(pool)
+
+            for s in g:
+                if 'large-dupe.bin' in s:
+                    break
+            else:
+                pytest.fail()
+            with open(s, 'a') as f:
+                f.write('added bytes since traversal')
+
+            dupes = finder.find(size, g)
+            assert not dupes
 
     def test_nested(self, pool, progress):
         with tempfile.TemporaryDirectory() as tmp:

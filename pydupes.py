@@ -5,11 +5,12 @@ import itertools
 import logging
 import os
 import pathlib
+import queue
 import stat
 import threading
 import typing
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, Executor, Future
+from concurrent.futures import Future
 
 import click
 from tqdm import tqdm
@@ -52,38 +53,87 @@ class FatalCrawlException(Exception):
     pass
 
 
-class PotentiallySingleThreadedExecutor(ThreadPoolExecutor):
+class FutureFreeThreadPool:
     # TODO: benchmark https://github.com/brmmm3/fastthreadpool
-    def __init__(self, max_workers: int, *args, **kwargs):
-        self.disable = True
-        if max_workers > 1:
-            self.disable = False
-            super().__init__(max_workers, *args, **kwargs)
+    def __init__(self, threads: int, queue_size: int = 2048):
+        assert threads > 0
+        self.work_queue = queue.Queue(maxsize=queue_size)
+        self.threads = [threading.Thread(target=self._worker_run, daemon=True)
+                        for _ in range(threads)]
+        for t in self.threads:
+            t.start()
 
-    def submit(self, fn, *args, **kwargs):
-        if self.disable:
-            f = Future()
-            f.set_result(fn(*args, **kwargs))
-            return f
-        else:
-            return super().submit(fn, *args, **kwargs)
+    def wait_until_complete(self):
+        self.work_queue.join()
 
-    def map(self, fn, *iterables):
-        if self.disable:
-            return list(map(fn, *iterables))
-        else:
-            return super().map(fn, *iterables)
+    def __enter__(self):
+        return self
 
     def __exit__(self, *args):
-        if not self.disable:
-            return super().__exit__(*args)
+        self.work_queue.join()
+        for _ in self.threads:
+            self.work_queue.put(None)
+        for t in self.threads:
+            t.join()
+
+    @staticmethod
+    def _run_task(fn_args):
+        fn, cb, args = fn_args
+        result = fn(*args)
+        if cb:
+            cb(result)
+
+    def _worker_run(self):
+        try:
+            while True:
+                fn_args = self.work_queue.get(block=True)
+                if fn_args is None:
+                    return
+                self._run_task(fn_args)
+                self.work_queue.task_done()
+                # allow GC
+                del fn_args
+        except Exception:
+            logger.exception('Unhandled error -- exit required')
+            exit(2)
+
+    def submit(self, fn, *args, callback=None):
+        if len(self.work_queue.queue) > 1024:
+            self._run_task((fn, callback, args))
+        else:
+            self.work_queue.put((fn, callback, args))
+
+    def map_unordered(self, fn, iterables):
+        size = len(iterables)
+        result = []
+        complete = threading.Event()
+
+        def map_callback(out):
+            result.append(out)
+            if size == len(result):
+                complete.set()
+
+        for args in iterables:
+            self.submit(fn, *args, callback=map_callback)
+        complete.wait()
+        return result
+
+    def map(self, fn, iterables):
+        wrapped = functools.partial(self._wrap_with_index, fn=fn)
+        iterables = list(enumerate(iterables))
+
+        result = self.map_unordered(wrapped, iterables)
+        result.sort(key=lambda ab: ab[0])
+        return [r for _, r in result]
+
+    @staticmethod
+    def _wrap_with_index(i, args, fn):
+        return i, fn(args)
 
 
 class FileCrawler:
-    __slots__ = ('_root_device', '_size_to_paths', '_pool', '_roots', '_traversed_inodes', '_prog', 'num_directories')
-
     def __init__(self, roots: typing.List[pathlib.Path],
-                 pool: Executor,
+                 pool: FutureFreeThreadPool,
                  progress: typing.Optional[tqdm] = None):
         assert roots
         if not all(r.is_dir() for r in roots):
@@ -101,7 +151,6 @@ class FileCrawler:
         self.num_directories = len(roots)
 
     def _traverse_path(self, path: str) -> typing.List[Future]:
-        futures = []
         next_dir = None
         for p in os.scandir(path):
             ppath = p.path
@@ -132,16 +181,16 @@ class FileCrawler:
                 if not next_dir:
                     next_dir = ppath
                 else:
-                    futures.append(self._pool.submit(self._traverse_path, ppath))
+                    self._pool.submit(self._traverse_path, ppath)
             else:
                 logger.debug('Skipping device/socket/unknown: %s', ppath)
         if next_dir:
-            futures.extend(self._traverse_path(next_dir))
-        return futures
+            self._traverse_path(next_dir)
 
     def traverse(self):
-        futures = [self._traverse_path(str(r)) for r in set(self._roots)]
-        self._unwrap_futures(itertools.chain.from_iterable(futures))
+        for r in sorted(set(self._roots)):
+            self._traverse_path(str(r))
+        self._pool.wait_until_complete()
 
     def size_bytes(self):
         return sum(k * len(v) for k, v in self._size_to_paths.items())
@@ -163,9 +212,7 @@ class FileCrawler:
 
 
 class DupeFinder:
-    __slots__ = ('_pool', '_output', '_file_progress', '_byte_progress',)
-
-    def __init__(self, pool: Executor,
+    def __init__(self, pool: FutureFreeThreadPool,
                  output: typing.Optional[typing.TextIO] = None,
                  file_progress: typing.Optional[tqdm] = None,
                  byte_progress: typing.Optional[tqdm] = None):
@@ -250,7 +297,7 @@ class DupeFinder:
               help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
 @click.option('--verbose', is_flag=True, help='Enable debug logging.')
 @click.option('--progress', is_flag=True, help='Enable progress bars.')
-@click.option('--concurrency', type=click.IntRange(min=1), default=16,
+@click.option('--concurrency', type=click.IntRange(min=1), default=8,
               help='Level of IO concurrency. Setting to 0 disables all threading/concurrency.')
 def main(input_paths, output, verbose, progress, concurrency):
     input_paths = [pathlib.Path(p) for p in input_paths]
@@ -264,7 +311,7 @@ def main(input_paths, output, verbose, progress, concurrency):
     time_start = datetime.datetime.now()
     with tqdm(smoothing=0, desc='Traversing', unit=' files',
               disable=not progress, mininterval=1) as file_progress, \
-            PotentiallySingleThreadedExecutor(max_workers=concurrency) as io_pool:
+            FutureFreeThreadPool(threads=concurrency) as io_pool:
         crawler = FileCrawler(input_paths, io_pool, file_progress)
         crawler.traverse()
 
@@ -281,13 +328,17 @@ def main(input_paths, output, verbose, progress, concurrency):
                 num_files,
                 sizeof_fmt(size))
     logger.info('Directory count: %d', crawler.num_directories)
+    logger.info('Number of candidate groups: %s (largest is %s files)',
+                len(size_groups), max((len(g) for _, g in size_groups), default=0))
     logger.info('Size filter reduced file count to: %d (%s)',
                 num_potential_dupes,
                 sizeof_fmt(size_potential_dupes))
     del crawler
 
-    with PotentiallySingleThreadedExecutor(max_workers=concurrency) as scheduler_pool, \
-            PotentiallySingleThreadedExecutor(max_workers=concurrency) as io_pool, \
+    size_groups.sort(key=lambda sg: sg[0] * len(sg[1]))
+
+    with FutureFreeThreadPool(threads=concurrency) as scheduler_pool, \
+            FutureFreeThreadPool(threads=concurrency) as io_pool, \
             tqdm(smoothing=0, desc='Filtering', unit=' files',
                  position=0, mininterval=1,
                  total=num_potential_dupes,
@@ -297,22 +348,28 @@ def main(input_paths, output, verbose, progress, concurrency):
                  total=size_potential_dupes, mininterval=1,
                  disable=not progress) as bytes_progress:
 
-        futures = []
-        sizes = []
+        size_num_dupes = []
         dupe_finder = DupeFinder(pool=io_pool, output=output,
                                  file_progress=file_progress, byte_progress=bytes_progress)
+
+        def callback(args):
+            size, dupes = args
+            size_num_dupes.append((size, len(dupes)))
+
+        def return_with_size(size_bytes, group):
+            dupes = dupe_finder.find(size_bytes, group)
+            return size_bytes, dupes
+
         while size_groups:
             size_bytes, group = size_groups.pop()
-            futures.append(scheduler_pool.submit(dupe_finder.find, size_bytes, group))
-            sizes.append(size_bytes)
+            scheduler_pool.submit(return_with_size, size_bytes, group, callback=callback)
+        scheduler_pool.wait_until_complete()
 
-        dupe_count = 0
-        dupe_total_size = 0
-        while futures:
-            dupes = futures.pop().result()
-            size_bytes = sizes.pop()
-            dupe_count += len(dupes)
-            dupe_total_size += len(dupes) * size_bytes
+    dupe_count = 0
+    dupe_total_size = 0
+    for size_bytes, num_dupes in size_num_dupes:
+        dupe_count += num_dupes
+        dupe_total_size += num_dupes * size_bytes
 
     dt_complete = datetime.datetime.now()
     logger.info('Comparison time: %.1fs', (dt_complete - time_traverse).total_seconds())
