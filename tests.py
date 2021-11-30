@@ -54,12 +54,14 @@ def create_dir1(root: pathlib.Path):
     os.symlink(f3, f10)
 
 
-class Pools:
-    future_free = FutureFreeThreadPool(threads=4)
-    future_free_small_queue = FutureFreeThreadPool(threads=2, queue_size=1)
+POOLS = [
+    FutureFreeThreadPool(threads=4),
+    FutureFreeThreadPool(threads=2, queue_size=1),
+    FutureFreeThreadPool(threads=1),
+]
 
 
-@pytest.mark.parametrize('pool', [Pools.future_free, Pools.future_free_small_queue])
+@pytest.mark.parametrize('pool', POOLS)
 @pytest.mark.parametrize('progress', [tqdm.tqdm(disable=True), None])
 class TestPydupes:
     def test_unable_read(self, pool, progress):

@@ -10,7 +10,6 @@ import stat
 import threading
 import typing
 from collections import defaultdict
-from concurrent.futures import Future
 
 import click
 from tqdm import tqdm
@@ -53,10 +52,27 @@ class FatalCrawlException(Exception):
     pass
 
 
+# https://stackoverflow.com/a/59832404/1337136
+def cache():
+    s = {}
+    setdefault = s.setdefault
+    n = 0
+
+    def add(x):
+        nonlocal n
+        n += 1
+        return setdefault(x, n) != n
+
+    return add
+
+
 class FutureFreeThreadPool:
     # TODO: benchmark https://github.com/brmmm3/fastthreadpool
     def __init__(self, threads: int, queue_size: int = 2048):
-        assert threads > 0
+        assert threads >= 0
+        if threads <= 1:
+            threads = 0
+
         self.work_queue = queue.Queue(maxsize=queue_size)
         self.threads = [threading.Thread(target=self._worker_run, daemon=True)
                         for _ in range(threads)]
@@ -98,7 +114,7 @@ class FutureFreeThreadPool:
             exit(2)
 
     def submit(self, fn, *args, callback=None):
-        if len(self.work_queue.queue) > 1024:
+        if not self.threads or len(self.work_queue.queue) > 1024:
             self._run_task((fn, callback, args))
         else:
             self.work_queue.put((fn, callback, args))
@@ -119,6 +135,9 @@ class FutureFreeThreadPool:
         return result
 
     def map(self, fn, iterables):
+        if not self.threads:
+            return list(map(fn, iterables))
+
         wrapped = functools.partial(self._wrap_with_index, fn=fn)
         iterables = list(enumerate(iterables))
 
@@ -146,11 +165,11 @@ class FileCrawler:
         self._size_to_paths = defaultdict(list)
         self._pool = pool
         self._roots = roots
-        self._traversed_inodes = set()
+        self._traversed_inodes = cache()
         self._prog = progress
         self.num_directories = len(roots)
 
-    def _traverse_path(self, path: str) -> typing.List[Future]:
+    def _traverse_path(self, path: str):
         next_dir = None
         for p in os.scandir(path):
             ppath = p.path
@@ -167,13 +186,12 @@ class FileCrawler:
             if stat.S_ISLNK(pstat.st_mode):
                 logger.debug('Skipping symlink %s', ppath)
                 continue
-            if pstat.st_ino in self._traversed_inodes:
+            if self._traversed_inodes(pstat.st_ino):
                 logger.debug('Skipping hardlink or already traversed %s', ppath)
                 continue
             if pstat.st_size == 0:
                 logger.debug('Skipping empty file $s', ppath)
                 continue
-            self._traversed_inodes.add(pstat.st_ino)
             if stat.S_ISREG(pstat.st_mode):
                 self._size_to_paths[pstat.st_size].append(ppath)
             elif stat.S_ISDIR(pstat.st_mode):
@@ -241,8 +259,8 @@ class DupeFinder:
                 if not hash:
                     # some read error occurred
                     continue
-                existing = hashes.get(hash)
-                if existing:
+                existing = hashes.setdefault(hash, p)
+                if existing != p:
                     dupes.append(p)
                     if self._output:
                         with lock:
@@ -251,8 +269,6 @@ class DupeFinder:
                             self._output.write('\0')
                             self._output.write(os.path.abspath(p))
                             self._output.write('\0')
-                else:
-                    hashes[hash] = p
                 if self._file_progress is not None:
                     self._file_progress.update(1)
                 if self._byte_progress is not None:
@@ -297,9 +313,11 @@ class DupeFinder:
               help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
 @click.option('--verbose', is_flag=True, help='Enable debug logging.')
 @click.option('--progress', is_flag=True, help='Enable progress bars.')
-@click.option('--concurrency', type=click.IntRange(min=1), default=8,
-              help='Level of IO concurrency. Setting to 0 disables all threading/concurrency.')
-def main(input_paths, output, verbose, progress, concurrency):
+@click.option('--read-concurrency', type=click.IntRange(min=1), default=8,
+              help='I/O concurrency for reading files.')
+@click.option('--traversal-concurrency', type=click.IntRange(min=1), default=1,
+              help='I/O concurrency for traversal (stat and listing syscalls).')
+def main(input_paths, output, verbose, progress, read_concurrency, traversal_concurrency):
     input_paths = [pathlib.Path(p) for p in input_paths]
     if not input_paths:
         click.echo(click.get_current_context().get_help())
@@ -311,7 +329,7 @@ def main(input_paths, output, verbose, progress, concurrency):
     time_start = datetime.datetime.now()
     with tqdm(smoothing=0, desc='Traversing', unit=' files',
               disable=not progress, mininterval=1) as file_progress, \
-            FutureFreeThreadPool(threads=concurrency) as io_pool:
+            FutureFreeThreadPool(threads=traversal_concurrency) as io_pool:
         crawler = FileCrawler(input_paths, io_pool, file_progress)
         crawler.traverse()
 
@@ -337,8 +355,8 @@ def main(input_paths, output, verbose, progress, concurrency):
 
     size_groups.sort(key=lambda sg: sg[0] * len(sg[1]))
 
-    with FutureFreeThreadPool(threads=concurrency) as scheduler_pool, \
-            FutureFreeThreadPool(threads=concurrency) as io_pool, \
+    with FutureFreeThreadPool(threads=read_concurrency) as scheduler_pool, \
+            FutureFreeThreadPool(threads=read_concurrency) as io_pool, \
             tqdm(smoothing=0, desc='Filtering', unit=' files',
                  position=0, mininterval=1,
                  total=num_potential_dupes,
