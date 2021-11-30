@@ -35,7 +35,7 @@ pipx run pydupes --help
 pydupes /path1 /path2 --progress --output dupes.txt
 
 # Sanity check a hardlinking of all matches:
-xargs -0 -n2 echo ln --force --verbose {} {} < dupes.txt
+xargs -0 -n2 echo ln --force --verbose < dupes.txt
 ```
 
 ## Benchmarks
