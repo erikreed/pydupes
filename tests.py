@@ -179,16 +179,13 @@ class TestPydupes:
             dupes = finder.find(size2, g2)
             assert len(dupes) == 11
 
-            pairs = collections.deque(output.getvalue().split('\0'))
-            assert pairs[-1] == ''
-            pairs.pop()
-
+            pairs = collections.deque(output.getvalue()[:-1].split('\0'))
             assert len(pairs) == 22
             while pairs:
                 a, b = pairs.popleft(), pairs.popleft()
-                assert 'nested' in b or 'dupe' in b
-                assert 'nested' not in a
-                assert 'dupe' not in a
+                assert 'nested' in a or 'dupe' in a
+                assert 'nested' not in b
+                assert 'dupe' not in b
 
 
 class TestIntegration:
@@ -203,14 +200,43 @@ class TestIntegration:
             result = runner.invoke(main, [str(d1), '--progress', '--output', tmp_file.name])
             assert result.exit_code == 0
 
-            output = tmp_file.read()
+            output = tmp_file.read()[:-1]
 
             pairs = collections.deque(output.split('\0'))
-            assert len(pairs) == 3
-            assert pairs[-1] == ''
-            pairs.pop()
+            assert len(pairs) == 2
             while pairs:
                 a, b = pairs.popleft(), pairs.popleft()
-                assert 'nested' in b or 'dupe' in b
-                assert 'nested' not in a
-                assert 'dupe' not in a
+                assert 'nested' in a or 'dupe' in a
+                assert 'nested' not in b
+                assert 'dupe' not in b
+
+    def test_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                tempfile.NamedTemporaryFile('r') as tmp_file:
+            tmp_dir = pathlib.Path(tmp_dir)
+            d1 = tmp_dir / 'dir1'
+            create_dir1(d1)
+
+            runner = CliRunner()
+            result = runner.invoke(main, [str(d1), '--traversal-checkpoint', d1 / 'checkpoint.gz'])
+            assert result.exit_code == 0
+            result = runner.invoke(main, [str(d1), '--traversal-checkpoint', d1 / 'checkpoint.gz',
+                                          '--output', tmp_file.name])
+            assert result.exit_code == 0
+
+            output1 = tmp_file.read()[:-1]
+            pairs = collections.deque(output1.split('\0'))
+            assert len(pairs) == 2
+            while pairs:
+                a, b = pairs.popleft(), pairs.popleft()
+                assert 'nested' in a or 'dupe' in a
+                assert 'nested' not in b
+                assert 'dupe' not in b
+
+            result = runner.invoke(main, [str(d1), '--traversal-checkpoint', d1 / 'checkpoint.gz',
+                                          '--output', tmp_file.name])
+            assert result.exit_code == 0
+
+            tmp_file.seek(0)
+            output2 = tmp_file.read()[:-1]
+            assert output1 == output2

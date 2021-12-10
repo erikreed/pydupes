@@ -1,7 +1,9 @@
 import datetime
 import functools
+import gzip
 import hashlib
 import itertools
+import json
 import logging
 import os
 import pathlib
@@ -13,6 +15,8 @@ from collections import defaultdict
 
 import click
 from tqdm import tqdm
+
+CHECKPOINT_SCHEMA = 'pydupes-v1'
 
 lock = threading.Lock()
 logger = logging.getLogger('pydupes')
@@ -68,7 +72,7 @@ def cache():
 
 class FutureFreeThreadPool:
     # TODO: benchmark https://github.com/brmmm3/fastthreadpool
-    def __init__(self, threads: int, queue_size: int = 2048):
+    def __init__(self, threads: int, queue_size: int = 32):
         assert threads >= 0
         if threads <= 1:
             threads = 0
@@ -153,7 +157,8 @@ class FutureFreeThreadPool:
 class FileCrawler:
     def __init__(self, roots: typing.List[pathlib.Path],
                  pool: FutureFreeThreadPool,
-                 progress: typing.Optional[tqdm] = None):
+                 progress: typing.Optional[tqdm] = None,
+                 min_size: int = 1):
         assert roots
         if not all(r.is_dir() for r in roots):
             raise FatalCrawlException("All roots required to be directories")
@@ -167,6 +172,7 @@ class FileCrawler:
         self._roots = roots
         self._traversed_inodes = cache()
         self._prog = progress
+        self._min_size = min_size
         self.num_directories = len(roots)
 
     def _traverse_path(self, path: str):
@@ -189,11 +195,9 @@ class FileCrawler:
             if self._traversed_inodes(pstat.st_ino):
                 logger.debug('Skipping hardlink or already traversed %s', ppath)
                 continue
-            if pstat.st_size == 0:
-                logger.debug('Skipping empty file $s', ppath)
-                continue
             if stat.S_ISREG(pstat.st_mode):
-                self._size_to_paths[pstat.st_size].append(ppath)
+                if self._min_size <= pstat.st_size:
+                    self._size_to_paths[pstat.st_size].append(ppath)
             elif stat.S_ISDIR(pstat.st_mode):
                 self.num_directories += 1
                 if not next_dir:
@@ -254,7 +258,7 @@ class DupeFinder:
         dupes = []
         for paths in path_groups:
             hashes = dict()
-            paths.sort(key=len)
+            paths.sort(key=lambda s: (s.count('/'), len(s), s))
             for p, hash in zip(paths, self._map(sha256sum, paths, size_bytes)):
                 if not hash:
                     # some read error occurred
@@ -265,9 +269,9 @@ class DupeFinder:
                     if self._output:
                         with lock:
                             # ensure these lines are printed atomically
-                            self._output.write(os.path.abspath(existing))
-                            self._output.write('\0')
                             self._output.write(os.path.abspath(p))
+                            self._output.write('\0')
+                            self._output.write(os.path.abspath(existing))
                             self._output.write('\0')
                 if self._file_progress is not None:
                     self._file_progress.update(1)
@@ -313,48 +317,35 @@ class DupeFinder:
               help='Save null-delimited input/duplicate filename pairs. For stdout use "-".')
 @click.option('--verbose', is_flag=True, help='Enable debug logging.')
 @click.option('--progress', is_flag=True, help='Enable progress bars.')
+@click.option('--min-size', type=click.IntRange(min=0), default=1,
+              help='Minimum file size (in bytes) to consider during traversal.')
 @click.option('--read-concurrency', type=click.IntRange(min=1), default=8,
               help='I/O concurrency for reading files.')
 @click.option('--traversal-concurrency', type=click.IntRange(min=1), default=1,
               help='I/O concurrency for traversal (stat and listing syscalls).')
-def main(input_paths, output, verbose, progress, read_concurrency, traversal_concurrency):
+@click.option('--traversal-checkpoint', type=click.Path(),
+              help='Persist the traversal index in jsonl format, or load an '
+                   'existing traversal if already exists. Use .gz extension to compress. Input paths are '
+                   'ignored if a traversal checkpoint is loaded.')
+def main(input_paths, output, verbose, progress, read_concurrency, traversal_concurrency,
+         traversal_checkpoint, min_size):
     input_paths = [pathlib.Path(p) for p in input_paths]
-    if not input_paths:
+    traversal_checkpoint = pathlib.Path(traversal_checkpoint) if traversal_checkpoint else None
+    if not input_paths and not traversal_checkpoint:
         click.echo(click.get_current_context().get_help())
         exit(1)
 
-    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
-    logger.info('Traversing input paths: %s', [str(p.absolute()) for p in input_paths])
-
     time_start = datetime.datetime.now()
-    with tqdm(smoothing=0, desc='Traversing', unit=' files',
-              disable=not progress, mininterval=1) as file_progress, \
-            FutureFreeThreadPool(threads=traversal_concurrency) as io_pool:
-        crawler = FileCrawler(input_paths, io_pool, file_progress)
-        crawler.traverse()
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
 
-    size = crawler.size_bytes()
-    size_unique = crawler.size_bytes_unique()
-    size_potential_dupes = size - size_unique
-    num_files = sum(1 for _ in crawler.files())
-    size_groups = crawler.filter_groups()
-    num_potential_dupes = sum(len(g) for _, g in size_groups)
+    if traversal_checkpoint and traversal_checkpoint.exists():
+        size_groups, num_potential_dupes, size_potential_dupes = load_traversal_checkpoint(
+            traversal_checkpoint)
+    else:
+        size_groups, num_potential_dupes, size_potential_dupes = traverse_paths(
+            progress, traversal_concurrency, input_paths, traversal_checkpoint, min_size)
 
-    time_traverse = datetime.datetime.now()
-    logger.info('Traversal time: %.1fs', (time_traverse - time_start).total_seconds())
-    logger.info('Cursory file count: %d (%s), excluding symlinks and dupe inodes',
-                num_files,
-                sizeof_fmt(size))
-    logger.info('Directory count: %d', crawler.num_directories)
-    logger.info('Number of candidate groups: %s (largest is %s files)',
-                len(size_groups), max((len(g) for _, g in size_groups), default=0))
-    logger.info('Size filter reduced file count to: %d (%s)',
-                num_potential_dupes,
-                sizeof_fmt(size_potential_dupes))
-    del crawler
-
-    size_groups.sort(key=lambda sg: sg[0] * len(sg[1]))
-
+    dt_filter_start = datetime.datetime.now()
     with FutureFreeThreadPool(threads=read_concurrency) as scheduler_pool, \
             FutureFreeThreadPool(threads=read_concurrency) as io_pool, \
             tqdm(smoothing=0, desc='Filtering', unit=' files',
@@ -367,8 +358,8 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
                  disable=not progress) as bytes_progress:
 
         size_num_dupes = []
-        dupe_finder = DupeFinder(pool=io_pool, output=output,
-                                 file_progress=file_progress, byte_progress=bytes_progress)
+        dupe_finder = DupeFinder(pool=io_pool, output=output, file_progress=file_progress,
+                                 byte_progress=bytes_progress)
 
         def callback(args):
             size, dupes = args
@@ -378,9 +369,12 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
             dupes = dupe_finder.find(size_bytes, group)
             return size_bytes, dupes
 
-        while size_groups:
-            size_bytes, group = size_groups.pop()
-            scheduler_pool.submit(return_with_size, size_bytes, group, callback=callback)
+        for size_bytes, group in size_groups:
+            if size_bytes >= min_size:
+                scheduler_pool.submit(return_with_size, size_bytes, group, callback=callback)
+            else:
+                file_progress.update(len(group))
+                bytes_progress.update(len(group) * size_bytes)
         scheduler_pool.wait_until_complete()
 
     dupe_count = 0
@@ -390,11 +384,90 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
         dupe_total_size += num_dupes * size_bytes
 
     dt_complete = datetime.datetime.now()
-    logger.info('Comparison time: %.1fs', (dt_complete - time_traverse).total_seconds())
+    logger.info('Comparison time: %.1fs', (dt_complete - dt_filter_start).total_seconds())
     logger.info('Total time elapsed: %.1fs', (dt_complete - time_start).total_seconds())
 
     logger.info('Number of duplicate files: %s', dupe_count)
     logger.info('Size of duplicate content: %s', sizeof_fmt(dupe_total_size))
+
+
+def load_traversal_checkpoint(traversal_checkpoint: pathlib.Path):
+    f = gzip.open(traversal_checkpoint, 'rt') if traversal_checkpoint.suffix == '.gz' else traversal_checkpoint.open()
+
+    header = json.loads(f.readline())
+    if header.get('schema') != CHECKPOINT_SCHEMA:
+        logger.critical("Traversal schema mismatched -- either malformed or incompatible. Header was: %s", header)
+        exit(3)
+
+    def size_groups_iter():
+        for line in f:
+            size, group = json.loads(line)
+            yield size, group
+
+        f.close()
+
+    num_potential_dupes = header['num_potential_dupes']
+    size_potential_dupes = header['size_potential_dupes']
+    return size_groups_iter(), num_potential_dupes, size_potential_dupes
+
+
+def traverse_paths(progress: bool, traversal_concurrency: int, input_paths: typing.List[pathlib.Path],
+                   traversal_checkpoint: typing.Optional[pathlib.Path], min_size: int):
+    logger.info('Traversing input paths: %s', [str(p.absolute()) for p in input_paths])
+
+    time_start = datetime.datetime.now()
+    with tqdm(smoothing=0, desc='Traversing', unit=' files',
+              disable=not progress, mininterval=1) as file_progress, \
+            FutureFreeThreadPool(threads=traversal_concurrency) as io_pool:
+        crawler = FileCrawler(input_paths, io_pool, file_progress, min_size)
+        crawler.traverse()
+    size = crawler.size_bytes()
+    size_unique = crawler.size_bytes_unique()
+    size_potential_dupes = size - size_unique
+    num_files = sum(1 for _ in crawler.files())
+    size_groups = crawler.filter_groups()
+    num_potential_dupes = sum(len(g) for _, g in size_groups)
+    time_traverse = datetime.datetime.now()
+    logger.info('Traversal time: %.1fs', (time_traverse - time_start).total_seconds())
+    logger.info('Cursory file count: %d (%s), excluding symlinks and dupe inodes',
+                num_files,
+                sizeof_fmt(size))
+    logger.info('Directory count: %d', crawler.num_directories)
+    logger.info('Number of candidate groups: %s (largest is %s files)',
+                len(size_groups), max((len(g) for _, g in size_groups), default=0))
+    logger.info('Size filter reduced file count to: %d (%s)',
+                num_potential_dupes,
+                sizeof_fmt(size_potential_dupes))
+    del crawler
+    size_groups.sort(key=lambda sg: sg[0] * len(sg[1]))
+    if traversal_checkpoint:
+        logger.info('Saving traversal checkpoint to: %s', traversal_checkpoint)
+        with (
+                gzip.open(traversal_checkpoint, 'wt')
+                if traversal_checkpoint.suffix == '.gz'
+                else traversal_checkpoint.open('w')
+        ) as f:
+            json.dump(dict(
+                num_potential_dupes=num_potential_dupes,
+                size_potential_dupes=size_potential_dupes,
+                group_count=len(size_groups),
+                file_count=num_potential_dupes,
+                schema=CHECKPOINT_SCHEMA
+            ), f)
+            f.write('\n')
+
+            prog = tqdm(reversed(size_groups), smoothing=0, desc='Saving traversal checkpoint',
+                        total=len(size_groups), mininterval=1,
+                        disable=not progress)
+            for i, row in enumerate(prog):
+                json.dump(row, f)
+                f.write('\n')
+
+    def popping_iterator():
+        while size_groups:
+            yield size_groups.pop()
+
+    return popping_iterator(), num_potential_dupes, size_potential_dupes
 
 
 if __name__ == '__main__':
