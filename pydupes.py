@@ -392,6 +392,7 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
 
 
 def load_traversal_checkpoint(traversal_checkpoint: pathlib.Path):
+    logger.info('Loading traversal checkpoint from: %s', traversal_checkpoint)
     f = gzip.open(traversal_checkpoint, 'rt') if traversal_checkpoint.suffix == '.gz' else traversal_checkpoint.open()
 
     header = json.loads(f.readline())
@@ -462,6 +463,8 @@ def traverse_paths(progress: bool, traversal_concurrency: int, input_paths: typi
             for i, row in enumerate(prog):
                 json.dump(row, f)
                 f.write('\n')
+        logger.info('Traversal checkpoint size: %s',
+                    sizeof_fmt(traversal_checkpoint.stat().st_size))
 
     def popping_iterator():
         while size_groups:
