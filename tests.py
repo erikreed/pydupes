@@ -9,7 +9,7 @@ import tqdm
 from click.testing import CliRunner
 
 from pydupes import (
-    DupeFinder, FileCrawler,
+    DupeFinder, FileCrawler, DuplicateComparator,
     FatalCrawlException, main, FutureFreeThreadPool)
 
 
@@ -240,3 +240,31 @@ class TestIntegration:
             tmp_file.seek(0)
             output2 = tmp_file.read()[:-1]
             assert output1 == output2
+
+
+def test_duplicate_comparator():
+    paths = [pathlib.Path('a/b/c'), pathlib.Path('e'), pathlib.Path('d')]
+    comp = DuplicateComparator(paths)
+
+    assert comp.key('d/data.txt') == (2, 1, 10, 'd/data.txt')
+
+    sample = [
+        "d/data/123.png",
+        "e/data/123.png",
+        "a/b/c/b.bin",
+        "a/b/c/a.bin",
+        "a/b/c/long-path.bin",
+        "a/b/c/d/c.bin",
+        "d/data/124.png",
+    ]
+    sample.sort(key=comp.key)
+    assert sample == [
+        "a/b/c/a.bin",
+        "a/b/c/b.bin",
+        "a/b/c/long-path.bin",
+        "a/b/c/d/c.bin",
+        "e/data/123.png",
+        "d/data/123.png",
+        "d/data/124.png",
+    ]
+    assert comp.min('d/data', 'e/data') == 'e/data'

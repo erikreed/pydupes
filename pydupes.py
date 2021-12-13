@@ -5,7 +5,7 @@ import hashlib
 import itertools
 import json
 import logging
-import os
+import os.path
 import pathlib
 import queue
 import stat
@@ -70,7 +70,25 @@ def cache():
     return add
 
 
+class DuplicateComparator:
+    def __init__(self, paths: typing.List[pathlib.Path]):
+        self._paths = tuple(paths)
+
+    def key(self, s: str) -> typing.Tuple[typing.Any, ...]:
+        for i, p in enumerate(self._paths):
+            if os.path.commonprefix((p, s)) == str(p):
+                match = i
+                break
+        else:
+            match = -len(self._paths)
+        return match, s.count('/'), len(s), s
+
+    def min(self, s1: str, s2: str) -> str:
+        return min((s1, s2), key=self.key)
+
+
 class FutureFreeThreadPool:
+
     # TODO: benchmark https://github.com/brmmm3/fastthreadpool
     def __init__(self, threads: int, queue_size: int = 32):
         assert threads >= 0
@@ -80,6 +98,7 @@ class FutureFreeThreadPool:
         self.work_queue = queue.Queue(maxsize=queue_size)
         self.threads = [threading.Thread(target=self._worker_run, daemon=True)
                         for _ in range(threads)]
+        self._threadid_to_event = defaultdict(threading.Event)
         for t in self.threads:
             t.start()
 
@@ -98,10 +117,10 @@ class FutureFreeThreadPool:
 
     @staticmethod
     def _run_task(fn_args):
-        fn, cb, args = fn_args
+        fn, callback, args = fn_args
         result = fn(*args)
-        if cb:
-            cb(result)
+        if callback:
+            callback(result)
 
     def _worker_run(self):
         try:
@@ -126,7 +145,7 @@ class FutureFreeThreadPool:
     def map_unordered(self, fn, iterables):
         size = len(iterables)
         result = []
-        complete = threading.Event()
+        complete = self._threadid_to_event[threading.get_ident()]
 
         def map_callback(out):
             result.append(out)
@@ -136,6 +155,7 @@ class FutureFreeThreadPool:
         for args in iterables:
             self.submit(fn, *args, callback=map_callback)
         complete.wait()
+        complete._flag = False
         return result
 
     def map(self, fn, iterables):
@@ -160,6 +180,7 @@ class FileCrawler:
                  progress: typing.Optional[tqdm] = None,
                  min_size: int = 1):
         assert roots
+        self._comparator = DuplicateComparator(roots)
         if not all(r.is_dir() for r in roots):
             raise FatalCrawlException("All roots required to be directories")
         root_stats = [r.lstat() for r in roots]
@@ -235,6 +256,7 @@ class FileCrawler:
 
 class DupeFinder:
     def __init__(self, pool: FutureFreeThreadPool,
+                 comparator: DuplicateComparator = None,
                  output: typing.Optional[typing.TextIO] = None,
                  file_progress: typing.Optional[tqdm] = None,
                  byte_progress: typing.Optional[tqdm] = None):
@@ -242,8 +264,9 @@ class DupeFinder:
         self._output = output
         self._file_progress = file_progress
         self._byte_progress = byte_progress
+        self._comparator = comparator or DuplicateComparator([])
 
-    def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str]:
+    def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str, ...]:
         files_start = len(paths)
         if size_bytes > 8192:
             path_groups = list(self._split_by_boundaries(size_bytes, paths))
@@ -258,7 +281,7 @@ class DupeFinder:
         dupes = []
         for paths in path_groups:
             hashes = dict()
-            paths.sort(key=lambda s: (s.count('/'), len(s), s))
+            paths.sort(key=self._comparator.key)
             for p, hash in zip(paths, self._map(sha256sum, paths, size_bytes)):
                 if not hash:
                     # some read error occurred
@@ -334,6 +357,7 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
     if not input_paths and not traversal_checkpoint:
         click.echo(click.get_current_context().get_help())
         exit(1)
+    comparator = DuplicateComparator(input_paths)
 
     time_start = datetime.datetime.now()
     logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO)
@@ -358,8 +382,8 @@ def main(input_paths, output, verbose, progress, read_concurrency, traversal_con
                  disable=not progress) as bytes_progress:
 
         size_num_dupes = []
-        dupe_finder = DupeFinder(pool=io_pool, output=output, file_progress=file_progress,
-                                 byte_progress=bytes_progress)
+        dupe_finder = DupeFinder(pool=io_pool, output=output, comparator=comparator,
+                                 file_progress=file_progress, byte_progress=bytes_progress)
 
         def callback(args):
             size, dupes = args
