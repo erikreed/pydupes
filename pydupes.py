@@ -116,8 +116,7 @@ class FutureFreeThreadPool:
             t.join()
 
     @staticmethod
-    def _run_task(fn_args):
-        fn, callback, args = fn_args
+    def _run_task(fn, callback, args):
         result = fn(*args)
         if callback:
             callback(result)
@@ -128,7 +127,7 @@ class FutureFreeThreadPool:
                 fn_args = self.work_queue.get(block=True)
                 if fn_args is None:
                     return
-                self._run_task(fn_args)
+                self._run_task(*fn_args)
                 self.work_queue.task_done()
                 # allow GC
                 del fn_args
@@ -138,7 +137,7 @@ class FutureFreeThreadPool:
 
     def submit(self, fn, *args, callback=None):
         if not self.threads or len(self.work_queue.queue) > 1024:
-            self._run_task((fn, callback, args))
+            self._run_task(fn, callback, args)
         else:
             self.work_queue.put((fn, callback, args))
 
