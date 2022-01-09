@@ -16,10 +16,16 @@ from collections import defaultdict
 import click
 from tqdm import tqdm
 
+# size of buffer to use when reading files for hashing or boundary comparison
+THREAD_MEMORY_BUFFER = 128 * 1024
+
+# size of beginning and edge boundary chunks to compare
+BOUNDARY_CHECK_SIZE = 4096
 CHECKPOINT_SCHEMA = 'pydupes-v1'
 
 lock = threading.Lock()
 logger = logging.getLogger('pydupes')
+thread_local = threading.local()
 
 
 def none_if_io_error(f):
@@ -43,13 +49,19 @@ def sizeof_fmt(num, suffix="B"):
 
 @none_if_io_error
 def sha256sum(path: str) -> bytes:
-    h = hashlib.sha256()
-    b = bytearray(128 * 1024)
-    mv = memoryview(b)
+    hasher = hashlib.sha256()
+    view = thread_local.memory_view
     with open(path, 'rb', buffering=0) as f:
-        for n in iter(lambda: f.readinto(mv), 0):
-            h.update(mv[:n])
-    return h.digest()
+        for n in iter(lambda: f.readinto(view), 0):
+            hasher.update(view[:n])
+    return hasher.digest()
+
+
+def _thread_init():
+    thread_local.memory_view = memoryview(bytearray(THREAD_MEMORY_BUFFER))
+
+
+_thread_init()
 
 
 class FatalCrawlException(Exception):
@@ -88,13 +100,13 @@ class DuplicateComparator:
 
 
 class FutureFreeThreadPool:
-
     # TODO: benchmark https://github.com/brmmm3/fastthreadpool
-    def __init__(self, threads: int, queue_size: int = 32):
+    def __init__(self, threads: int, queue_size: int = 32, init_fn=_thread_init):
         assert threads >= 0
         if threads <= 1:
             threads = 0
 
+        self.init_fn = init_fn
         self.work_queue = queue.Queue(maxsize=queue_size)
         self.threads = [threading.Thread(target=self._worker_run, daemon=True)
                         for _ in range(threads)]
@@ -122,6 +134,8 @@ class FutureFreeThreadPool:
             callback(result)
 
     def _worker_run(self):
+        if self.init_fn:
+            self.init_fn()
         try:
             while True:
                 fn_args = self.work_queue.get(block=True)
@@ -184,7 +198,8 @@ class FileCrawler:
             raise FatalCrawlException("All roots required to be directories")
         root_stats = [r.lstat() for r in roots]
         root_device_ids = [r.st_dev for r in root_stats]
-        assert len(set(root_device_ids)) == 1, 'Unable to span multiple devices'
+        if len(set(root_device_ids)) != 1:
+            raise FatalCrawlException("Unable to span multiple devices")
         self._root_device = root_device_ids[0]
 
         self._size_to_paths = defaultdict(list)
@@ -267,7 +282,7 @@ class DupeFinder:
 
     def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str, ...]:
         files_start = len(paths)
-        if size_bytes > 8192:
+        if size_bytes > BOUNDARY_CHECK_SIZE * 2:
             path_groups = list(self._split_by_boundaries(size_bytes, paths))
         else:
             path_groups = [paths]
@@ -303,19 +318,17 @@ class DupeFinder:
 
     @staticmethod
     @none_if_io_error
-    def _read_boundary(path: str, size: int, use_hash=True) -> typing.Union[bytes, int]:
+    def _read_boundary_hash(path: str, size: int) -> int:
         with open(path, 'rb', buffering=0) as f:
             if size < 0:
                 f.seek(size, os.SEEK_END)
             boundary = f.read(abs(size))
-        if use_hash:
             return hash(boundary)
-        return boundary
 
     def _split_by_boundary(self, size_bytes: int, group: typing.List[str], end: bool):
         matches = defaultdict(list)
-        size = -4096 if end else 4096
-        boundaries = self._map(functools.partial(self._read_boundary, size=size), group, size_bytes)
+        size = -BOUNDARY_CHECK_SIZE if end else BOUNDARY_CHECK_SIZE
+        boundaries = self._map(functools.partial(self._read_boundary_hash, size=size), group, size_bytes)
         for path, edge in zip(group, boundaries):
             matches[edge].append(path)
         return [g for boundary, g in matches.items() if boundary is not None and len(g) > 1]
@@ -341,7 +354,7 @@ class DupeFinder:
 @click.option('--progress', is_flag=True, help='Enable progress bars.')
 @click.option('--min-size', type=click.IntRange(min=0), default=1,
               help='Minimum file size (in bytes) to consider during traversal.')
-@click.option('--read-concurrency', type=click.IntRange(min=1), default=8,
+@click.option('--read-concurrency', type=click.IntRange(min=1), default=4,
               help='I/O concurrency for reading files.')
 @click.option('--traversal-concurrency', type=click.IntRange(min=1), default=1,
               help='I/O concurrency for traversal (stat and listing syscalls).')
