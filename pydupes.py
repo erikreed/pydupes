@@ -1,3 +1,4 @@
+import collections
 import datetime
 import functools
 import gzip
@@ -108,6 +109,7 @@ class FutureFreeThreadPool:
 
         self.init_fn = init_fn
         self.work_queue = queue.Queue(maxsize=queue_size)
+        self.queue_size = queue_size
         self.threads = [threading.Thread(target=self._worker_run, daemon=True)
                         for _ in range(threads)]
         self._threadid_to_event = defaultdict(threading.Event)
@@ -150,7 +152,7 @@ class FutureFreeThreadPool:
             exit(2)
 
     def submit(self, fn, *args, callback=None):
-        if not self.threads or len(self.work_queue.queue) > 1024:
+        if not self.threads or len(self.work_queue.queue) >= self.queue_size:
             self._run_task(fn, callback, args)
         else:
             self.work_queue.put((fn, callback, args))
@@ -211,38 +213,39 @@ class FileCrawler:
         self.num_directories = len(roots)
 
     def _traverse_path(self, path: str):
-        next_dir = None
-        for p in os.scandir(path):
-            ppath = p.path
-            if self._prog is not None:
-                self._prog.update(1)
-            try:
-                pstat = p.stat(follow_symlinks=False)
-            except OSError as e:
-                logger.error('Unable to stat %s due to: %s', ppath, e)
-                continue
-            if pstat.st_dev != self._root_device:
-                logger.debug('Skipping file on separate device %s', ppath)
-                continue
-            if stat.S_ISLNK(pstat.st_mode):
-                logger.debug('Skipping symlink %s', ppath)
-                continue
-            if self._traversed_inodes(pstat.st_ino):
-                logger.debug('Skipping hardlink or already traversed %s', ppath)
-                continue
-            if stat.S_ISREG(pstat.st_mode):
-                if self._min_size <= pstat.st_size:
-                    self._size_to_paths[pstat.st_size].append(ppath)
-            elif stat.S_ISDIR(pstat.st_mode):
-                self.num_directories += 1
-                if not next_dir:
-                    next_dir = ppath
+        frontier = collections.deque()
+        frontier.append(path)
+
+        while frontier:
+            path = frontier.popleft()
+            for p in os.scandir(path):
+                ppath = p.path
+                if self._prog is not None:
+                    self._prog.update(1)
+                try:
+                    pstat = p.stat(follow_symlinks=False)
+                except OSError as e:
+                    logger.error('Unable to stat %s due to: %s', ppath, e)
+                    continue
+                if pstat.st_dev != self._root_device:
+                    logger.debug('Skipping file on separate device %s', ppath)
+                    continue
+                if stat.S_ISLNK(pstat.st_mode):
+                    logger.debug('Skipping symlink %s', ppath)
+                    continue
+                if self._traversed_inodes(pstat.st_ino):
+                    logger.debug('Skipping hardlink or already traversed %s', ppath)
+                    continue
+                if stat.S_ISREG(pstat.st_mode):
+                    if self._min_size <= pstat.st_size:
+                        self._size_to_paths[pstat.st_size].append(ppath)
+                elif stat.S_ISDIR(pstat.st_mode):
+                    self.num_directories += 1
+                    if len(frontier) > 32:
+                        self._pool.submit(self._traverse_path, frontier.popleft())
+                    frontier.append(ppath)
                 else:
-                    self._pool.submit(self._traverse_path, ppath)
-            else:
-                logger.debug('Skipping device/socket/unknown: %s', ppath)
-        if next_dir:
-            self._traverse_path(next_dir)
+                    logger.debug('Skipping device/socket/unknown: %s', ppath)
 
     def traverse(self):
         for r in sorted(set(self._roots)):
@@ -283,9 +286,9 @@ class DupeFinder:
     def find(self, size_bytes: int, paths: typing.List[str]) -> typing.Tuple[str, ...]:
         files_start = len(paths)
         if size_bytes > BOUNDARY_CHECK_SIZE * 2:
-            path_groups = list(self._split_by_boundaries(size_bytes, paths))
+            path_groups = tuple(self._split_by_boundaries(size_bytes, paths))
         else:
-            path_groups = [paths]
+            path_groups = (paths,)
         files_end = sum(len(p) for p in path_groups)
         if self._file_progress is not None:
             self._file_progress.update(files_start - files_end)
@@ -331,7 +334,8 @@ class DupeFinder:
         boundaries = self._map(functools.partial(self._read_boundary_hash, size=size), group, size_bytes)
         for path, edge in zip(group, boundaries):
             matches[edge].append(path)
-        return [g for boundary, g in matches.items() if boundary is not None and len(g) > 1]
+        return [paths for boundary, paths in matches.items()
+                if boundary is not None and len(paths) > 1]
 
     def _split_by_boundaries(self, size_bytes: int, group: typing.List[str]):
         groups = self._split_by_boundary(size_bytes, group, end=False)

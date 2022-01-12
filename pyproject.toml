@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pydupes"
-version = "0.6.0"
+version = "0.6.1"
 description = "A duplicate file finder that may be faster in environments with millions of files and terabytes of data."
 authors = ["Erik Reed <erik.reed@pm.me>"]
 license = "MIT"
